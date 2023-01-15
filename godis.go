@@ -112,38 +112,6 @@ func FindKeyRead(key *Gobj) *Gobj {
 	return server.db.data.Get(key)
 }
 
-func initServer(config *Config) error {
-	server.port = config.Port
-	server.clients = make(map[int]*GodisClient)
-	server.db = &GodisDB{
-		data:   DictCreate(DictType{HashFunc: GStrHash, EqualFunc: GStrEqual}),
-		expire: DictCreate(DictType{HashFunc: GStrHash, EqualFunc: GStrEqual}),
-	}
-	var err error
-	if server.el, err = AeCreateEventLoop(); err != nil {
-		return err
-	}
-	server.fd, err = TcpServer(server.port)
-	return err
-}
-
-// run background
-func serverCron(eventLoop *aeEventLoop, id int, extra interface{}) {
-
-}
-
-func acceptTcpHandler(eventLoop *aeEventLoop, fd int, extra interface{}) {
-	cfd, err := Accept(fd)
-	if err != nil {
-		log.Printf("accept client err: %v\n", err)
-		return
-	}
-	client := CreateClient(cfd)
-	server.clients[cfd] = client
-	server.el.AddFileEvent(fd, AE_READABLE, readQueryFromClient, client)
-	log.Printf("accept client, fd: %v\n", cfd)
-}
-
 func (c *GodisClient) findLineInQuery() (int, error) {
 	index := strings.Index(string(c.queryBuf[:c.queryLen]), "\r\n")
 	if index < -1 && c.queryLen > GODIS_MAX_INLINE {
@@ -158,6 +126,39 @@ func (c *GodisClient) getNumInQuery(s, e int) (int, error) {
 	c.queryBuf = c.queryBuf[e+2:]
 	c.queryLen -= e + 2
 	return num, err
+}
+
+func resetClient(c *GodisClient) {
+	freeArgs(c)
+	c.reqType = GODIS_REQ_UNKNOW
+	c.bulkLen = 0
+	c.bulkNum = 0
+}
+
+func freeArgs(c *GodisClient) {
+	for _, v := range c.args {
+		v.DecrRefCount()
+	}
+}
+
+func freeReplyList(c *GodisClient) {
+	if c.reply.Length() != 0 {
+		n := c.reply.head
+		c.reply.DelNode(n)
+		n.Val.DecrRefCount()
+	}
+}
+
+func freeClient(c *GodisClient) {
+	/* Close socket, unregister kevents, and remove list of replies and
+	 * accumulated arguments. */
+	// 关闭套接字，并从事件处理器中删除该套接字的事件
+	freeArgs(c)
+	freeReplyList(c)
+	delete(server.clients, c.fd)
+	server.el.RemoveFileEvent(c.fd, AE_READABLE)
+	server.el.RemoveFileEvent(c.fd, AE_WRITABLE)
+	Close(c.fd)
 }
 
 func (c *GodisClient) AddReplyStr(str string) {
@@ -205,15 +206,6 @@ func sendReplyToClient(el *aeEventLoop, fd int, extra interface{}) {
 	}
 }
 
-func CreateClient(fd int) *GodisClient {
-	var client GodisClient
-	client.fd = fd
-	client.db = server.db
-	client.queryBuf = make([]byte, GODIS_IOBUF_LEN)
-	client.reply = listCreate(ListType{EqualFunc: GStrEqual})
-	return &client
-}
-
 func readQueryFromClient(el *aeEventLoop, fd int, extra interface{}) {
 	//client read
 	client := extra.(*GodisClient)
@@ -227,81 +219,14 @@ func readQueryFromClient(el *aeEventLoop, fd int, extra interface{}) {
 		return
 	}
 	client.queryLen += n
+	log.Printf("read %v bytes from client:%v\n", n, client.fd)
+	log.Printf("ReadQueryFromClient, queryBuf : %v\n", string(client.queryBuf))
 	err = processQueryBuf(client)
 	if err != nil {
 		log.Printf("process query buf err: %v\n", err)
 		freeClient(client)
 		return
 	}
-}
-
-func processQueryBuf(c *GodisClient) error {
-	for len(c.queryBuf) > 0 {
-		if c.reqType == GODIS_REQ_UNKNOW {
-			if c.queryBuf[0] == '*' {
-				// MultiBulk命令
-				c.reqType = GODIS_REQ_MULTIBULK
-			} else {
-				// Inline命令
-				c.reqType = GODIS_REQ_INLINE
-			}
-		}
-		var ok bool
-		var err error
-		if c.reqType == GODIS_REQ_INLINE {
-			ok, err = processInlineBuffer(c)
-		} else if c.reqType == GODIS_REQ_MULTIBULK {
-			ok, err = processMultiBulkBuffer(c)
-		} else {
-			return errors.New("Unknown request type")
-		}
-		if err != nil {
-			return err
-		}
-		if ok {
-			if len(c.args) == 0 {
-				resetClient(c)
-			} else {
-				processCommand(c)
-			}
-		} else {
-			//queryBuf read不完整
-			break
-		}
-	}
-	return nil
-}
-
-func processCommand(c *GodisClient) {
-	cmdStr := c.args[0].StrVal()
-	if cmdStr == "quit" {
-		/* Close connection after entire reply has been sent. */
-		// 如果指定了写入之后关闭客户端 FLAG ，那么关闭客户端
-		freeClient(c)
-		return
-	}
-	cmd := lookupCommand(cmdStr)
-	if cmd == nil {
-		c.AddReplyStr("-ERR: unknown command")
-		resetClient(c)
-		return
-	} else if cmd.arity != len(c.args) {
-		c.AddReplyStr(fmt.Sprintf("-ERR: wrong number of arguments for %s command", cmd.name))
-		resetClient(c)
-		return
-	}
-	cmd.proc(c)
-	resetClient(c)
-}
-
-func lookupCommand(cmdStr string) *GodisCommand {
-
-	for _, c := range GodisCommandTable {
-		if cmdStr == c.name {
-			return &c
-		}
-	}
-	return nil
 }
 
 func processMultiBulkBuffer(c *GodisClient) (bool, error) {
@@ -381,33 +306,113 @@ func processInlineBuffer(c *GodisClient) (bool, error) {
 	return true, nil
 }
 
-func resetClient(c *GodisClient) {
-	freeArgsAndReply(c)
-	c.reqType = GODIS_REQ_UNKNOW
-	c.bulkLen = 0
-	c.bulkNum = 0
+func processQueryBuf(c *GodisClient) error {
+	for len(c.queryBuf) > 0 {
+		if c.reqType == GODIS_REQ_UNKNOW {
+			if c.queryBuf[0] == '*' {
+				// MultiBulk命令
+				c.reqType = GODIS_REQ_MULTIBULK
+			} else {
+				// Inline命令
+				c.reqType = GODIS_REQ_INLINE
+			}
+		}
+		var ok bool
+		var err error
+		if c.reqType == GODIS_REQ_INLINE {
+			ok, err = processInlineBuffer(c)
+		} else if c.reqType == GODIS_REQ_MULTIBULK {
+			ok, err = processMultiBulkBuffer(c)
+		} else {
+			return errors.New("Unknown request type")
+		}
+		if err != nil {
+			return err
+		}
+		if ok {
+			if len(c.args) == 0 {
+				resetClient(c)
+			} else {
+				processCommand(c)
+			}
+		} else {
+			//queryBuf read不完整
+			break
+		}
+	}
+	return nil
 }
 
-func freeArgsAndReply(c *GodisClient) {
-	for _, v := range c.args {
-		v.DecrRefCount()
+func processCommand(c *GodisClient) {
+	cmdStr := c.args[0].StrVal()
+	if cmdStr == "quit" {
+		/* Close connection after entire reply has been sent. */
+		// 如果指定了写入之后关闭客户端 FLAG ，那么关闭客户端
+		freeClient(c)
+		return
 	}
-	if c.reply.length != 0 {
-		n := c.reply.head
-		c.reply.DelNode(n)
-		n.Val.DecrRefCount()
+	cmd := lookupCommand(cmdStr)
+	if cmd == nil {
+		c.AddReplyStr("-ERR: unknown command")
+		resetClient(c)
+		return
+	} else if cmd.arity != len(c.args) {
+		c.AddReplyStr(fmt.Sprintf("-ERR: wrong number of arguments for %s command", cmd.name))
+		resetClient(c)
+		return
 	}
+	cmd.proc(c)
+	resetClient(c)
 }
 
-func freeClient(c *GodisClient) {
-	/* Close socket, unregister kevents, and remove list of replies and
-	 * accumulated arguments. */
-	// 关闭套接字，并从事件处理器中删除该套接字的事件
-	freeArgsAndReply(c)
-	delete(server.clients, c.fd)
-	server.el.RemoveFileEvent(c.fd, AE_READABLE)
-	server.el.RemoveFileEvent(c.fd, AE_WRITABLE)
-	Close(c.fd)
+func lookupCommand(cmdStr string) *GodisCommand {
+	for _, c := range GodisCommandTable {
+		if cmdStr == c.name {
+			return &c
+		}
+	}
+	return nil
+}
+
+// TODO:run background
+func serverCron(eventLoop *aeEventLoop, id int, extra interface{}) {
+
+}
+
+func CreateClient(fd int) *GodisClient {
+	var client GodisClient
+	client.fd = fd
+	client.db = server.db
+	client.queryBuf = make([]byte, GODIS_IOBUF_LEN)
+	client.reply = listCreate(ListType{EqualFunc: GStrEqual})
+	return &client
+}
+
+func acceptTcpHandler(eventLoop *aeEventLoop, fd int, extra interface{}) {
+	cfd, err := Accept(fd)
+	if err != nil {
+		log.Printf("accept client err: %v\n", err)
+		return
+	}
+	client := CreateClient(cfd)
+	server.clients[cfd] = client
+	server.el.AddFileEvent(cfd, AE_READABLE, readQueryFromClient, client)
+	log.Printf("accept client, fd: %v\n", cfd)
+}
+
+func initServer(config *Config) error {
+	server.port = config.Port
+	server.clients = make(map[int]*GodisClient)
+	server.db = &GodisDB{
+		data:   DictCreate(DictType{HashFunc: GStrHash, EqualFunc: GStrEqual}),
+		expire: DictCreate(DictType{HashFunc: GStrHash, EqualFunc: GStrEqual}),
+	}
+	var err error
+	if server.el, err = AeCreateEventLoop(); err != nil {
+		return err
+	}
+	server.fd, err = TcpServer(server.port)
+	return err
 }
 
 func main() {

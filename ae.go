@@ -46,7 +46,6 @@ type aeEventLoop struct {
 	TimeEvents      *AeTimeEvent
 	timeEventNextId int
 	stop            bool
-	state           [128]syscall.Kevent_t
 }
 
 // var fe2kq = [3]int{0, syscall.EVFILT_READ, syscall.EVFILT_WRITE}
@@ -72,7 +71,6 @@ func getFeKey(fd int, mask FeType) int {
 
 func AeCreateEventLoop() (*aeEventLoop, error) {
 	kqfd, err := syscall.Kqueue()
-
 	if err != nil {
 		return nil, err
 	}
@@ -177,20 +175,18 @@ func (eventLoop *aeEventLoop) aeSearchNearestTime() int64 {
 	return nearest
 }
 
-func (eventLoop *aeEventLoop) AeWait() (fes []*AeFileEvent, tes []*AeTimeEvent, err error) {
+func (eventLoop *aeEventLoop) AeWait() (fes []*AeFileEvent, tes []*AeTimeEvent) {
 	timeout := eventLoop.aeSearchNearestTime() - GetMsTime()
 
 	if timeout <= 0 {
 		timeout = 10 //at least wait 10ms
 	}
 	var events [128]syscall.Kevent_t
-	events = eventLoop.state
 	var timespec syscall.Timespec
-	timespec.Sec = timeout / 1000
 	timespec.Nsec = timeout * 1000
 	n, err := syscall.Kevent(eventLoop.FileEventFd, nil, events[:], &timespec)
 	if err != nil {
-		log.Printf("kevent wait err: %v\n", err)
+		//log.Printf("kevent wait err: %v\n", err)
 	}
 	if n > 0 {
 		log.Printf("get %v kevents\n", n)
@@ -245,10 +241,7 @@ func (eventLoop *aeEventLoop) AeProcess(fes []*AeFileEvent, tes []*AeTimeEvent) 
 
 func (eventLoop *aeEventLoop) AeMain() {
 	for eventLoop.stop != true {
-		fes, tes, err := eventLoop.AeWait()
-		if err != nil {
-			eventLoop.stop = true
-		}
+		fes, tes := eventLoop.AeWait()
 		if len(fes) > 0 {
 			log.Printf("ae wait,get %v file kevents\n", len(fes))
 		}

@@ -26,7 +26,7 @@ func listCreate(listType ListType) *List {
 func (list *List) AddNodeHead(value *Gobj) {
 	var node Node
 	node.Val = value
-	if list.length == 0 {
+	if list.head == nil {
 		list.head = &node
 		list.tail = &node
 	} else {
@@ -65,6 +65,7 @@ func (list *List) DelNode(node *Node) {
 	} else {
 		list.tail = node.prev
 	}
+	list.length--
 }
 
 func (list *List) Length() int {
