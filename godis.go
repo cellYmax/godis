@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"godis/net"
 	"hash/fnv"
 	"log"
 	"os"
@@ -74,25 +75,129 @@ func GStrHash(key *Gobj) int64 {
 var server GodisServer
 var GodisCommandTable []GodisCommand = []GodisCommand{
 	{"get", getCommand, 2},
-	{"set", setCommand, 3},
+	{"set", setCommand, -3},
+	{"expire", expireCommand, 3},
+	{"setnx", setnxCommand, 3},
+	//TODO
+	//{"del",delCommand, -2},
+	//{"strlen",strlenCommand, 2},
+	//{"incr",incrCommand, 2},
+	//{"decr",decrCommand, 2},
+	//{"del",delCommand, -2},
+	//{"lpush",lpushCommand, -3},
+	//{"rpush",rpushCommand, -3},
+	//{"sadd",saddCommand, -3},
+	//{"zadd",zaddCommand, -4},
+	//{"hset",hsetCommand, 4},
+	//{"hget",hgetCommand, 3},
+	//{"auth",authCommand, 2},
+	//{"ping",pingCommand, 1},
+	//{"echo",echoCommand, 2},
 }
 
-func setCommand(c *GodisClient) {
+func setnxCommand(c *GodisClient) {
+	setGenericCommand(c, REDIS_SET_NX, c.args[1], c.args[2], nil, 0)
+}
+
+func expireCommand(c *GodisClient) {
 	key := c.args[1]
 	val := c.args[2]
 	if val.Type != GODIS_STRING {
+		//TODO: extract shared.strings
 		c.AddReplyStr("-ERR: wrong type\r\n")
+	}
+	expire := GetMsTime() + (val.IntVal() * 1000)
+	expireObj := CreateFromInt(expire)
+	server.db.expire.Set(key, expireObj)
+	expireObj.DecrRefCount()
+	c.AddReplyStr("+OK\r\n")
+}
+
+const (
+	UNIT_SECONDS = iota
+	UNIT_MILLISECONDS
+)
+
+const (
+	REDIS_SET_NO_FLAGS = 0
+	REDIS_SET_NX       = 1 << 0 //Set if key not exists
+	REDIS_SET_XX       = 1 << 1 //Set if key exists
+)
+
+func setCommand(c *GodisClient) {
+	var expire *Gobj
+	unit := UNIT_SECONDS
+	flags := REDIS_SET_NO_FLAGS
+	for i := 3; i < len(c.args); i++ {
+		var next *Gobj
+		if i == len(c.args)-1 {
+			next = nil
+		} else {
+			next = c.args[i+1]
+		}
+
+		str := c.args[i].StrVal()
+		a := []byte(str)
+		if len(a) == 2 {
+			if (a[0] == 'n' || a[0] == 'N') &&
+				(a[1] == 'x' || a[1] == 'X') {
+				flags |= REDIS_SET_NX
+			} else if (a[0] == 'x' || a[0] == 'N') &&
+				(a[1] == 'x' || a[1] == 'X') {
+				flags |= REDIS_SET_XX
+			} else if (a[0] == 'e' || a[0] == 'E') &&
+				(a[1] == 'x' || a[1] == 'X') && next != nil {
+				unit = UNIT_SECONDS
+				expire = next
+				i++
+			} else if (a[0] == 'p' || a[0] == 'P') &&
+				(a[1] == 'x' || a[1] == 'X') && next != nil {
+				unit = UNIT_MILLISECONDS
+				expire = next
+				i++
+			}
+		} else {
+			c.AddReplyStr("-ERR syntax error\r\n")
+		}
+	}
+	//key := c.args[1]
+	//val := c.args[2]
+	//if val.Type != GODIS_STRING {
+	//	c.AddReplyStr("-ERR: wrong type\r\n")
+	//}
+	//server.db.data.Set(key, val)
+	//server.db.expire.Delete(key)
+	//c.AddReplyStr("+OK\r\n")
+	setGenericCommand(c, flags, c.args[1], c.args[2], expire, unit)
+}
+
+func setGenericCommand(c *GodisClient, flags int, key *Gobj, val *Gobj, expire *Gobj, unit int) {
+	var milliseconds int64 = 0
+	if expire != nil {
+		milliseconds = expire.IntVal()
+		if milliseconds < 0 {
+			c.AddReplyStr("invalid expire time in SETEX")
+			return
+		}
+		if unit == UNIT_SECONDS {
+			milliseconds *= 1000
+		}
+	}
+	if (flags&REDIS_SET_NX != 0) && FindKeyWrite(key) != nil ||
+		(flags&REDIS_SET_XX != 0) && FindKeyWrite(key) == nil {
+		c.AddReplyStr("$-1\r\n")
+		return
 	}
 	server.db.data.Set(key, val)
 	server.db.expire.Delete(key)
+	if expire != nil {
+		expireTime := GetMsTime() + milliseconds
+		expireObj := CreateFromInt(expireTime)
+		server.db.expire.Set(key, expireObj)
+		expireObj.DecrRefCount()
+	}
 	c.AddReplyStr("+OK\r\n")
-	//setGenericCommand(c, flags, c.args[1], c.args[2], expire, unit, NULL, NULL)
 }
-
-//
-//func setGenericCommand(c *GodisClient, flags int, key *Gobj, val *Gobj, expire *Gobj, unit int, ok_reply *Gobj, abort_reply *Gobj) {
-//
-//}
 
 func getCommand(c *GodisClient) {
 	key := c.args[1]
@@ -107,8 +212,15 @@ func getCommand(c *GodisClient) {
 	}
 
 }
+
 func FindKeyRead(key *Gobj) *Gobj {
-	//expireIfNeeded()
+	//TODO:expireIfNeeded()
+	//TODO:更新命中/不命中信息
+	return server.db.data.Get(key)
+}
+
+func FindKeyWrite(key *Gobj) *Gobj {
+	//TODO:expireIfNeeded()
 	return server.db.data.Get(key)
 }
 
@@ -128,13 +240,6 @@ func (c *GodisClient) getNumInQuery(s, e int) (int, error) {
 	return num, err
 }
 
-func resetClient(c *GodisClient) {
-	freeArgs(c)
-	c.reqType = GODIS_REQ_UNKNOW
-	c.bulkLen = 0
-	c.bulkNum = 0
-}
-
 func freeArgs(c *GodisClient) {
 	for _, v := range c.args {
 		v.DecrRefCount()
@@ -149,6 +254,13 @@ func freeReplyList(c *GodisClient) {
 	}
 }
 
+func resetClient(c *GodisClient) {
+	freeArgs(c)
+	c.reqType = GODIS_REQ_UNKNOW
+	c.bulkLen = 0
+	c.bulkNum = 0
+}
+
 func freeClient(c *GodisClient) {
 	/* Close socket, unregister kevents, and remove list of replies and
 	 * accumulated arguments. */
@@ -158,7 +270,7 @@ func freeClient(c *GodisClient) {
 	delete(server.clients, c.fd)
 	server.el.RemoveFileEvent(c.fd, AE_READABLE)
 	server.el.RemoveFileEvent(c.fd, AE_WRITABLE)
-	Close(c.fd)
+	net.Close(c.fd)
 }
 
 func (c *GodisClient) AddReplyStr(str string) {
@@ -183,7 +295,7 @@ func sendReplyToClient(el *aeEventLoop, fd int, extra interface{}) {
 		bufLen := len(buf)
 		if c.sentLen < bufLen {
 			// 写入内容到套接字
-			n, err := Write(fd, buf)
+			n, err := net.Write(fd, buf)
 			if err != nil {
 				log.Printf("send reply err: %v\n", err)
 				freeClient(c)
@@ -212,7 +324,7 @@ func readQueryFromClient(el *aeEventLoop, fd int, extra interface{}) {
 	if len(client.queryBuf)-client.queryLen < GODIS_MAX_BULK {
 		client.queryBuf = append(client.queryBuf, make([]byte, GODIS_MAX_BULK)...)
 	}
-	n, err := Read(fd, client.queryBuf)
+	n, err := net.Read(fd, client.queryBuf)
 	if err != nil {
 		log.Printf("client %v read err: %v\n", fd, err)
 		freeClient(client)
@@ -356,7 +468,7 @@ func processCommand(c *GodisClient) {
 		c.AddReplyStr("-ERR: unknown command")
 		resetClient(c)
 		return
-	} else if cmd.arity != len(c.args) {
+	} else if cmd.arity > 0 && cmd.arity != len(c.args) {
 		c.AddReplyStr(fmt.Sprintf("-ERR: wrong number of arguments for %s command", cmd.name))
 		resetClient(c)
 		return
@@ -389,7 +501,7 @@ func CreateClient(fd int) *GodisClient {
 }
 
 func acceptTcpHandler(eventLoop *aeEventLoop, fd int, extra interface{}) {
-	cfd, err := Accept(fd)
+	cfd, err := net.Accept(fd)
 	if err != nil {
 		log.Printf("accept client err: %v\n", err)
 		return
@@ -411,7 +523,7 @@ func initServer(config *Config) error {
 	if server.el, err = AeCreateEventLoop(); err != nil {
 		return err
 	}
-	server.fd, err = TcpServer(server.port)
+	server.fd, err = net.TcpServer(server.port)
 	return err
 }
 

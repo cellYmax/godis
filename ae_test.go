@@ -3,12 +3,13 @@ package main
 import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
+	"godis/net"
 	"testing"
 )
 
 func WriteProc(loop *aeEventLoop, fd int, extra interface{}) {
 	buf := extra.([]byte)
-	n, err := Write(fd, buf)
+	n, err := net.Write(fd, buf)
 	if err != nil {
 		fmt.Printf("write err: %v\n", err)
 		return
@@ -19,7 +20,7 @@ func WriteProc(loop *aeEventLoop, fd int, extra interface{}) {
 
 func ReadProc(loop *aeEventLoop, fd int, extra interface{}) {
 	buf := make([]byte, 10)
-	n, err := Read(fd, buf)
+	n, err := net.Read(fd, buf)
 	if err != nil {
 		fmt.Printf("read err: %v\n", err)
 		return
@@ -29,7 +30,7 @@ func ReadProc(loop *aeEventLoop, fd int, extra interface{}) {
 }
 
 func AcceptProc(loop *aeEventLoop, fd int, extra interface{}) {
-	cfd, err := Accept(fd)
+	cfd, err := net.Accept(fd)
 	if err != nil {
 		fmt.Printf("accept err: %v\n", err)
 		return
@@ -50,18 +51,18 @@ func NormalProc(loop *aeEventLoop, id int, extra interface{}) {
 func TestAe(t *testing.T) {
 	eventLoop, err := AeCreateEventLoop()
 	assert.Nil(t, err)
-	sfd, err := TcpServer(6666)
+	sfd, err := net.TcpServer(6666)
 	eventLoop.AddFileEvent(sfd, AE_READABLE, AcceptProc, nil)
 	go eventLoop.AeMain()
 	host := [4]byte{0, 0, 0, 0}
-	cfd, err := Connect(host, 6666)
+	cfd, err := net.Connect(host, 6666)
 	assert.Nil(t, err)
 	msg := "helloworld"
-	n, err := Write(cfd, []byte(msg))
+	n, err := net.Write(cfd, []byte(msg))
 	assert.Nil(t, err)
 	assert.Equal(t, 10, n)
 	buf := make([]byte, 10)
-	n, err = Read(cfd, buf)
+	n, err = net.Read(cfd, buf)
 	assert.Nil(t, err)
 	assert.Equal(t, 10, n)
 	assert.Equal(t, msg, string(buf))
