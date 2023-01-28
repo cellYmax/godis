@@ -18,9 +18,9 @@ const (
 )
 
 const (
-	GODIS_REQ_UNKNOW = iota
-	GODIS_REQ_INLINE
-	GODIS_REQ_MULTIBULK
+	GODIS_REQ_UNKNOW    = 0
+	GODIS_REQ_INLINE    = 1
+	GODIS_REQ_MULTIBULK = 2
 )
 
 type GodisCommandProc func(c *GodisClient)
@@ -63,6 +63,7 @@ func GStrEqual(a *Gobj, b *Gobj) bool {
 	}
 	return a.StrVal() == b.StrVal()
 }
+
 func GStrHash(key *Gobj) int64 {
 	if key.Type != GODIS_STRING {
 		return 0
@@ -257,6 +258,7 @@ func freeReplyList(c *GodisClient) {
 func resetClient(c *GodisClient) {
 	freeArgs(c)
 	c.reqType = GODIS_REQ_UNKNOW
+	c.queryBuf = c.queryBuf[0:0]
 	c.bulkLen = 0
 	c.bulkNum = 0
 }
@@ -320,23 +322,23 @@ func sendReplyToClient(el *aeEventLoop, fd int, extra interface{}) {
 
 func readQueryFromClient(el *aeEventLoop, fd int, extra interface{}) {
 	//client read
-	client := extra.(*GodisClient)
-	if len(client.queryBuf)-client.queryLen < GODIS_MAX_BULK {
-		client.queryBuf = append(client.queryBuf, make([]byte, GODIS_MAX_BULK)...)
+	c := extra.(*GodisClient)
+	if len(c.queryBuf)-c.queryLen < GODIS_MAX_BULK {
+		c.queryBuf = append(c.queryBuf, make([]byte, GODIS_MAX_BULK)...)
 	}
-	n, err := net.Read(fd, client.queryBuf)
+	n, err := net.Read(fd, c.queryBuf)
 	if err != nil {
 		log.Printf("client %v read err: %v\n", fd, err)
-		freeClient(client)
+		freeClient(c)
 		return
 	}
-	client.queryLen += n
-	log.Printf("read %v bytes from client:%v\n", n, client.fd)
-	log.Printf("ReadQueryFromClient, queryBuf : %v\n", string(client.queryBuf))
-	err = processQueryBuf(client)
+	c.queryLen += n
+	log.Printf("read %v bytes from client:%v\n", n, c.fd)
+	log.Printf("ReadQueryFromClient, queryBuf : %v\n", string(c.queryBuf))
+	err = processQueryBuf(c)
 	if err != nil {
 		log.Printf("process query buf err: %v\n", err)
-		freeClient(client)
+		freeClient(c)
 		return
 	}
 }
@@ -465,11 +467,11 @@ func processCommand(c *GodisClient) {
 	}
 	cmd := lookupCommand(cmdStr)
 	if cmd == nil {
-		c.AddReplyStr("-ERR: unknown command")
+		c.AddReplyStr("-ERR: unknown command\r\n")
 		resetClient(c)
 		return
 	} else if cmd.arity > 0 && cmd.arity != len(c.args) {
-		c.AddReplyStr(fmt.Sprintf("-ERR: wrong number of arguments for %s command", cmd.name))
+		c.AddReplyStr(fmt.Sprintf("-ERR: wrong number of arguments for %s command\r\n", cmd.name))
 		resetClient(c)
 		return
 	}
@@ -495,7 +497,7 @@ func CreateClient(fd int) *GodisClient {
 	var client GodisClient
 	client.fd = fd
 	client.db = server.db
-	client.queryBuf = make([]byte, GODIS_IOBUF_LEN)
+	client.queryBuf = make([]byte, 0, GODIS_IOBUF_LEN)
 	client.reply = listCreate(ListType{EqualFunc: GStrEqual})
 	return &client
 }
